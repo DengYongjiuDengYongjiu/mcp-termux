@@ -1,0 +1,13 @@
+*.log
+*.o
+*.bak
+notes/
+
+# 大二进制文件通过 GitHub Release 分发
+# deploy/mcp
+# deploy/mcp_boot
+# deploy/stackplz
+# deploy/paradise
+# deploy/radare2/
+# deploy/kmodules/
+# deploy/preload_libs/
