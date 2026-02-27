@@ -145,6 +145,20 @@ static std::string sq_esc(const std::string& s) {
     return r;
 }
 
+// Base64 encode for safe shell transport
+static std::string base64_encode(const std::string &in) {
+    static const char t[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    int v = 0, bits = -6;
+    for (unsigned char c : in) {
+        v = (v << 8) + c; bits += 8;
+        while (bits >= 0) { out.push_back(t[(v >> bits) & 0x3F]); bits -= 6; }
+    }
+    if (bits > -6) out.push_back(t[((v << 8) >> (bits + 8)) & 0x3F]);
+    while (out.size() % 4) out.push_back('=');
+    return out;
+}
+
 static std::string wrap_root_cmd(const std::string& cmd) {
     std::string tmpf = std::string(TERMUX_TMP) + "/_mcp_cmd_" + gen_id().substr(0,8) + ".sh";
     std::string script = "#!/data/data/com.termux/files/usr/bin/bash\n"
@@ -3121,7 +3135,7 @@ static json run_tool(const std::string& nm, const json& a, const Config& cfg,
             py += "nid=str(int(time.time()*1000))\n"
                 "note={'id':nid,'tag':'" + sq_esc(tag) + "','content':'" + sq_esc(content) + "','time':time.strftime('%Y-%m-%d %H:%M:%S')}\n"
                 "with open(os.path.join(ND,nid+'.json'),'w') as f: json.dump(note,f,ensure_ascii=False)\n"
-                "print(f'Note saved: id={nid} tag={note[\"tag\"]}')\n";
+                "print('Note saved: id='+nid+' tag='+note.get('tag',''))\n";
         } else if (action == "list") {
             std::string tag = a.value("tag", "");
             py += "notes=[]\n"
@@ -3224,21 +3238,18 @@ static json run_tool(const std::string& nm, const json& a, const Config& cfg,
         std::string sql = a.value("sql", "");
         if (db.empty() || sql.empty()) return terr("db and sql required");
         int limit = a.value("limit", 100);
-        // Use Python's sqlite3 module
-        std::string py;
+        // Build Python script, encode as base64 to avoid shell escaping hell
+        std::string pyscript;
         if (sql == ".tables") {
-            py = "python3 -c \"\nimport sqlite3\nconn=sqlite3.connect('" + sq_esc(db) + "')\nc=conn.cursor()\nc.execute(\"SELECT name FROM sqlite_master WHERE type='table' ORDER BY name\")\nfor r in c.fetchall(): print(r[0])\nconn.close()\n\"";
+            pyscript = "import sqlite3\nconn=sqlite3.connect('" + sq_esc(db) + "')\nc=conn.cursor()\nc.execute(\"SELECT name FROM sqlite_master WHERE type='table' ORDER BY name\")\n[print(r[0]) for r in c.fetchall()]\nconn.close()";
         } else if (sql.substr(0,7) == ".schema") {
             std::string tbl = sql.size() > 8 ? sql.substr(8) : "%";
-            py = "python3 -c \"\nimport sqlite3\nconn=sqlite3.connect('" + sq_esc(db) + "')\nc=conn.cursor()\nc.execute(\"SELECT sql FROM sqlite_master WHERE name LIKE '" + sq_esc(tbl) + "'\")\nfor r in c.fetchall():\n  if r[0]: print(r[0]+';')\nconn.close()\n\"";
+            pyscript = "import sqlite3\nconn=sqlite3.connect('" + sq_esc(db) + "')\nc=conn.cursor()\nc.execute(\"SELECT sql FROM sqlite_master WHERE name LIKE '" + sq_esc(tbl) + "'\")\nfor r in c.fetchall():\n  if r[0]: print(r[0]+';')\nconn.close()";
         } else {
-            py = "python3 -c \"\nimport sqlite3,json\nconn=sqlite3.connect('" + sq_esc(db) + "')\nconn.row_factory=sqlite3.Row\nc=conn.cursor()\nc.execute('" + sq_esc(sql) + "')\n"
-                "rows=c.fetchmany(" + std::to_string(limit) + ")\n"
-                "if c.description:\n  cols=[d[0] for d in c.description]\n  print('|'.join(cols))\n  print('-'*60)\n  for r in rows: print('|'.join(str(r[c]) for c in cols))\n"
-                "  print(f'\\n({len(rows)} rows)')\n"
-                "else:\n  print(f'OK, {c.rowcount} rows affected')\n"
-                "conn.close()\n\"";
+            pyscript = "import sqlite3\nconn=sqlite3.connect('" + sq_esc(db) + "')\nconn.row_factory=sqlite3.Row\nc=conn.cursor()\nc.execute('" + sq_esc(sql) + "')\nrows=c.fetchmany(" + std::to_string(limit) + ")\nif c.description:\n  cols=[d[0] for d in c.description]\n  print('|'.join(cols))\n  print('-'*60)\n  for r in rows: print('|'.join(str(r[col]) for col in cols))\n  print(str(len(rows))+' rows')\nelse:\n  print('OK')\nconn.close()";
         }
+        std::string b64py = base64_encode(pyscript);
+        std::string py = "echo '" + b64py + "' | base64 -d | python3";
         auto r = run_root_cmd(py, a.value("timeout", 15), cfg.max_out);
         return tjson({{"exit_code", r.exit_code}, {"output", r.out + r.err}, {"timed_out", r.timed_out}});
     }
@@ -3249,12 +3260,11 @@ static json run_tool(const std::string& nm, const json& a, const Config& cfg,
         std::string content = a.value("content", "");
         if (path.empty() || content.empty()) return terr("path and content required");
         bool exec = a.value("executable", false);
-        // Write via Python to handle escaping properly
-        std::string py = "python3 -c \"\nwith open('" + sq_esc(path) + "','w') as f: f.write( + content + )\nprint('Written: " + sq_esc(path) + "')\n\"";
-        auto r = run_root_cmd(py, a.value("timeout", 10), cfg.max_out);
-        if (exec) {
-            run_root_cmd("chmod 755 '" + sq_esc(path) + "'", 5, 256);
-        }
+        // Write content via base64 pipe to avoid escaping issues
+        std::string b64 = base64_encode(content);
+        std::string cmd = "echo '" + b64 + "' | base64 -d > '" + sq_esc(path) + "'";
+        if (exec) cmd += " && chmod 755 '" + sq_esc(path) + "'";
+        auto r = run_root_cmd(cmd, a.value("timeout", 10), cfg.max_out);
         return tjson({{"exit_code", r.exit_code}, {"output", r.out + r.err}, {"timed_out", r.timed_out}});
     }
 
